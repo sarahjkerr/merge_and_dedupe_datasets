@@ -1,0 +1,164 @@
+---
+title: "Database Management: Merging Two Lists of Organizations Without Creating Duplicates"
+output: html_notebook
+---
+
+### **About R Notebooks**
+* An [R Markdown](http://rmarkdown.rstudio.com) allows you to write, execute, and see the results of code all in one continuous screen (much like Jupyter Notebooks for Python). 
+* To execute code in the notebook, you can click the *Run* button directly above the chunk, or click inside it and press *Ctrl+Shift+Enter* (*cmd+Shift+Enter* on Mac). 
+* To add a new chunk, press *ctrl + alt + i* (*cmd+Shift+i* on Mac)
+* Checkout other [keyboard shortcuts](https://support.rstudio.com/hc/en-us/articles/200711853-Keyboard-Shortcuts) for RStudio to save yourself a little time.
+* This notebook can be stylized using [markdown syntax](https://github.com/adam-p/markdown-here/wiki/Markdown-Cheatsheet).
+
+### **About this Project**
+
+This walkthrough is a very high-level overview of how you can merge two datasets while minimizing the creation of duplicates intended for relatively new R programmers. Additional tutorials about managing performance when matching larger datasets, or slightly more complicated match methods can be found [here-link forthcoming].
+
+#### **The Example: Problem**
+
+Hats for Cats is a [***not real***] 501(c)(3) that provides knit hats for cats in New York City. As we all know, cats are notoriously lazy, and aren't going to knit themselves any hats, and New York has a seriosu wind chill issue.
+
+Hats for Cats has a large, central office in Manhattan where administrative staff oversee its operations. It has 3 smaller regional offices in Brooklyn, the Bronx, and Queens.
+
+Hats for Cats distribute their hats in Brooklyn, the Bronx, and Queens by working with local pet stores, animal shelters, and individual cat enthusiasts. They've had relationships with some of these organizations for several years, and are consistently forming relationships with new pet stores, shelters, and enthusiasts as they emerge.
+
+The admin staff tracks these relationships in a centralized MS SQL Server database. Regional offices are required to send an Excel spreadsheet to them every 6 months with a log of all the outreach they've had with their partners during that time. This includes both old and new partners.
+
+We are Hats for Cats data engineers responsible for updating the database with the interaction records: Adding new organizations with whom Hats for Cats has formed relationships, updating the contact information for existing organizations they've worked with, and recording interaction details. However, we don't have a unique identifier for these organizations-- like their EIN-- so there's no quick and easy way to say definitely whether an organization already exists in their database.
+
+#### **The Example: Solution Overview**
+
+In order to update their database without creating duplicates, we need to:
+
+1. Match the list of organizations in the database to the list organizations in the sheet by geographic distance
+2. Validate those matches based on name similarity
+3. Keep matches with a high validity score, review matches with an iffy validity score, and toss matches with a low validity score
+
+### **Walkthrough**
+
+
+#### **Load Your Libraries and Code Snippets**
+
+The clean_text vignette is a snippet I developed to quickly strip parnter names of stopwords (e.g., "The","And", "of", etc.), punctuation, and make it lowercase. This becomes important when you match organizations on name similarity rather than, or in addition to, geographic distance. 
+
+The snippet is also available for download, and you can edit it to fit your own data cleaning needs. To access this snippet, simply change the filepath to whatever folder in which you've stored the snippet.
+
+I'll provide more details about the libraries later on as we use them.
+
+**Side Note About Storing Your Code:** As you can see, my snippet is stored in a folder I've named "vignettes;" since I use this function in multiple projects, I want to store it in a neutral folder, rather than in the directory of any one project. If I made custom changes to this snippet to closely fit a project (for example, if I were deduplication lists of doctor's offices, I might want to add "MD" to my list of stopwords), then I would store a copy of that specialized function in a functions folder specifically in that project's directory.
+
+If you don't want to write and run your own functions, you can also use the [tm package](https://cran.r-project.org/web/packages/tm/index.html) for text preparation.
+
+```{r, warning=FALSE,message=FALSE}
+library(fuzzyjoin)
+library(readr)
+library(rBES)
+
+source('~/Vignettes/clean_text.R')
+
+```
+
+#### **Load Your Assets**
+
+This is where you'll connect to the entity lists you're comparing, whether it's via a direct SQL Server connection, and API to a third party data source, an uploaded CSV, etc.
+
+For simplicity, I've used two uploaded CSVs for this example, which are also available for download. In keeping with good project architecture, if you're uploading assets, upload them to a 'data' folder in your project directory.
+
+```{r}
+primary_database <-read_csv("~/Dedupe/full_matching_example/matching_example_primary_org_list.csv")
+new_org_list <- read_csv("~/Dedupe/full_matching_example/matching_example_new_org_list.csv")
+```
+
+
+#### **Perform Data Cleaning**
+
+Here you'll do any data prepping needed to make the matching run smoothly. For this example, we'll run the clean_text snippet. You could also correct spellings, change data types, change column headers, change your text to [tidy format](https://www.tidytextmining.com/tidytext.html) if needed, etc. 
+
+```{r}
+primary_database$clean_org_name <- sapply(primary_database$org_name, clean_text)
+new_org_list$clean_org_name <- sapply(new_org_list$org_name, clean_text)
+```
+
+
+#### **Geocode Your Addresses**
+
+Distance-based matching requires you to use a latitude and longitude. The fantastic [rBES package](https://github.com/gmculp/rBES) developed by Gretchen Culp is tailored to clean and geocode NYC-specific addresses. It allows you to capitalize on the NYC Department of City Planning's Geosupport Tool API via invoking the [rGBAT package](https://github.com/gmculp/rGBAT16AB) (also built by Gretchen Culp). 
+
+If you're working with locations outside of NYC, Jesse Sadler has a great overview of [geocoding with ggmap](https://www.jessesadler.com/post/geocoding-with-r/).
+
+**Note:** Don't forget to check the data types for your latitude and longitude columns and change them if needed. Sometimes, the output will default to chr, but we need numeric to perform distance-based matching.
+
+```{r, warning=FALSE,message=FALSE}
+geocode_fields <- c('F1E.longitude','F1E.latitude','F1E.com_schl_dist','F1E.city_council','F1E.output.hse_nbr_disp',
+                    'F1A.addr_range_1ax1.st_name','F1E.USPS_city_name','F1E.zip_code','F1E.output.boro_name',
+                    'F1A.mh_ri_flag','F1E.output.ret_code','F1E.output.msg')
+
+source_cols <- c('org_name','org_address1','org_boro','org_zip','clean_org_name')
+
+primary_db_geocoded <- NYC.CleanGeoZip(in_df = primary_database, id_colname="org_name", addr1_colname="org_address1", addr2_colname=NULL, city_colname = "org_boro",zip_colname="org_zip", source_cols=source_cols, geocode_fields=geocode_fields, GBAT_name="18A")
+
+new_org_list_geocoded <- NYC.CleanGeoZip(in_df = new_org_list, id_colname="org_name", addr1_colname="org_address1", addr2_colname=NULL, city_colname = "org_boro",zip_colname="org_zip", source_cols=source_cols, geocode_fields=geocode_fields, GBAT_name="18A")
+
+primary_db_geocoded$F1E.latitude <- as.numeric(as.character(primary_db_geocoded$F1E.latitude))
+primary_db_geocoded$F1E.longitude <- as.numeric(as.character(primary_db_geocoded$F1E.longitude))
+
+new_org_list_geocoded$F1E.latitude <- as.numeric(as.character(new_org_list_geocoded$F1E.latitude))
+new_org_list_geocoded$F1E.longitude <- as.numeric(as.character(new_org_list_geocoded$F1E.longitude))
+```
+
+#### **Option 1: Match Based on Geographic Distance**
+
+We use the [fuzzyjoin package](https://cran.r-project.org/web/packages/fuzzyjoin/index.html) to join the two dataframes based on how far apart they are. We calculate geographic distance using the [Haversine Formula](https://rosettacode.org/wiki/Haversine_formula). 
+
+For this example, I'm left joining the new org list to the existing database org list. I'm doing this so that my output dataframe is effectively a list of which organizations match, and which might be new organizations for which we'll create new entries.
+
+```{r}
+
+joined_org_lists <- geo_left_join(new_org_list_geocoded, primary_db_geocoded, by = c("F1E.latitude","F1E.longitude"), method = c("haversine"), max_dist = 0.003, unit = c("km"), distance_col = "Geo_Dist")
+```
+
+
+#### **Option 1 Continued: Validate Matches by Calculating Name Similarity**
+For calculating the name similarity between two columns, we can call the [adist function](https://www.rdocumentation.org/packages/utils/versions/3.6.0/topics/adist) from the utils package.
+
+```{r}
+joined_org_lists$name_sim <- mapply(adist, joined_org_lists$clean_org_name.x, joined_org_lists$clean_org_name.y)
+```
+
+#### **Option 1 Continued: Review Matches & Non-Matches**
+
+If we were working with larger datasets, we'd want to determine the threshold at which we'd automatically approve, flag for rewiew, or reject poor matches. This also takes a bit of trial and error, and some very basic ML "training" to get right. I'll cover this is another how-to in the future.
+
+However, we're only working with 5 rows of data, so it's pretty easy for us to see what matches well, what matches are iffy, what matches are no-go's, and what had no matches. 
+
+If we look at the output below, we can see that Furry Paws Milliner and Steinway Grand Cats already exist in the database. They've matched perfectly based on geographic distance, but their names have slight differences. Thus, we want to check these manually (or, in a larger system, flag them for another automated review process) to make sure they're true matches.
+
+Otherwise, it looks like Not Just Lizards, LLC., ABC Pets 'n' More, and Sarah's Cat Enthusiast Club are new organizations we need to add to our central database.
+
+```{r}
+simplified_cols <- c('org_name.x','org_address1.x','org_name.y','org_address1.y','Geo_Dist','name_sim')
+
+simplified_df <- joined_org_lists[simplified_cols]
+
+simplified_df
+```
+
+
+
+#### **Option 2: Match Based on Name Similarity**
+
+Let's say we exist in an alternate universe where Hats for Cats doesn't keep address information for their partner organizations. We can jump right to matching based on name similarity using the following code.
+
+I use the Jaro Winkler edit distance because it works well on shorter strings and runs a bit faster than Levenshtein or Damerau-Levenshtein. I've chosen the 0.18 max edit distance after a bit of trial and error; I recommend tinkering around with edit distance thresholds when getting ready to merge datasets, since every dataset can have its unique quirks that impact matching.
+
+If you're still trying to decide which algorithm works the best for your project, there are [many resources](http://users.cecs.anu.edu.au/~Peter.Christen/publications/tr-cs-06-02.pdf) that examine performance, scale, and data quality as factors into which one to choose.
+
+```{r}
+joined_org_lists_name_matches_only <- stringdist_left_join(new_org_list, primary_database, by = "clean_org_name", method = c("jw"), max_dist = 0.18, distance_col = "name_sim")
+```
+
+#### **Some Final Words**
+
+This was a crash course in dataset matching; if you're planning on working with large datasets, I'd recommend reading up on how to improve matching algothrim performance.
+
+If you're looking for more complicated matching techniques, or are working with a more complex dataset, check out Flávio Juvenal's [Jupyter Notebook about deduplication](https://nbviewer.jupyter.org/github/vintasoftware/deduplication-slides/blob/master/slides-reduced.ipynb).
